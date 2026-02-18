@@ -23,7 +23,7 @@ SESSIONS_JSON = SESSIONS_PATH / "sessions.json"
 RUNS_JSON = OPENCLAW_HOME / "agents" / "main" / "subagents" / "runs.json"
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Dashboard HTML template (defined before routes that use it)
 DASHBOARD_HTML = '''<!DOCTYPE html>
@@ -262,6 +262,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         .agent-card.stalled::before {
             background: linear-gradient(90deg, transparent, var(--accent-orange), transparent);
+        }
+        .role-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 6px;
+            font-weight: 600;
+        }
+        .role-badge.main {
+            background: var(--accent-blue);
+            color: var(--bg-dark);
+        }
+        .role-badge.cron {
+            background: var(--text-secondary);
+            color: var(--bg-dark);
         }
         .agent-header {
             display: flex;
@@ -890,8 +905,17 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         async function fetchSubagents() {
             try {
                 const response = await fetch('/api/subagents');
-                const data = await response.json();
-                return data.subagents || [];
+                if (!response.ok) {
+                    console.warn('Subagents API returned', response.status);
+                    return [];
+                }
+                const text = await response.text();
+                if (!text || !text.trim()) {
+                    console.warn('Subagents API returned empty body');
+                    return [];
+                }
+                const data = JSON.parse(text);
+                return Array.isArray(data.subagents) ? data.subagents : [];
             } catch (error) {
                 console.error('Error fetching subagents:', error);
                 return [];
@@ -1010,11 +1034,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const heartbeat = getHeartbeatMeta(agent);
             const consoleText = getConsoleText(agent);
             
+            const roleBadge = agent.role === 'main' ? '<span class="role-badge main">Main</span>' : agent.role === 'cron' ? '<span class="role-badge cron">Cron</span>' : '';
             return `
-                <div class="${cardClass}" id="agent-${agent.sessionId}">
+                <div class="${cardClass}" id="agent-${agent.sessionId}" data-role="${agent.role || 'subagent'}">
                     <div class="agent-header">
                         <div>
-                            <div class="agent-title">Agent ${index + 1}</div>
+                            <div class="agent-title">Agent ${index + 1} ${roleBadge}</div>
                             <div class="agent-model">${agent.model || 'unknown'}</div>
                         </div>
                         <span class="status-indicator ${lane === 'completed' ? 'active' : lane === 'in_progress' ? 'working' : lane === 'queue' ? 'idle' : lane === 'blocked' ? 'stalled' : 'stalled'}" title="${lane === 'in_progress' ? 'In Progress' : lane === 'queue' ? 'Queue' : lane === 'blocked' ? 'Blocked' : lane === 'completed' ? 'Completed' : 'Cancelled'}"></span>
@@ -1087,7 +1112,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 grid.innerHTML = `
                     <div class="empty-state">
                         <h2>No Active Subagents</h2>
-                        <p>No subagents are currently running. They will appear here when spawned.</p>
+                        <p>No sessions found. Main and subagents appear here when listed from sessions.json.</p>
                     </div>
                 `;
                 return;
@@ -1647,7 +1672,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                             <div class="kanban-task ${movingClass} ${enterClass}" data-session-id="${agent.sessionId}" onclick="${onClickHandler}">
                                 <div class="kanban-task-header">
                                     <div>
-                                        <div class="kanban-task-title">${agent.task || 'No task description'}</div>
+                                        <div class="kanban-task-title">${agent.task || 'No task description'} ${agent.role === 'main' ? '<span class="role-badge main">Main</span>' : agent.role === 'cron' ? '<span class="role-badge cron">Cron</span>' : ''}</div>
                                         <div class="kanban-task-agent">Agent ${idx + 1}: ${agent.model || 'unknown'}</div>
                                     </div>
                                     ${statusBadge}
@@ -1726,12 +1751,13 @@ def load_sessions():
         return []
 
 def run_tracker(command, *args, json_output=True):
-    """Run subagent-tracker command and return parsed JSON."""
+    """Run subagent-tracker command and return parsed JSON. Pass OPENCLAW_HOME so tracker uses same data as dashboard."""
     cmd = [sys.executable, str(TRACKER_SCRIPT), command] + list(args)
     if json_output:
         cmd.append("--json")
+    env = {**os.environ, "OPENCLAW_HOME": str(OPENCLAW_HOME)}
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env, cwd=str(OPENCLAW_HOME))
         if result.returncode != 0:
             return {"error": result.stderr or "Command failed"}
         if json_output:
@@ -1755,73 +1781,76 @@ def favicon():
     from flask import Response
     return Response(status=204)
 
-@app.route('/api/subagents')
-def get_subagents():
-    """Get list of active subagents."""
-    result = run_tracker("list", "--active", "60")
-    if "error" in result:
-        return jsonify({"error": result["error"], "subagents": []}), 500
-    
-    agents = result if isinstance(result, list) else []
-    
-    # Load runs.json to get task descriptions
-    runs_json_path = OPENCLAW_HOME / "subagents" / "runs.json"
+def _enrich_agents_with_runs(agents):
+    """Enrich agents with task data from RUNS_JSON. Match by key or sessionId. Keeps task from tracker (session) if runs don't have it."""
     runs_by_key = {}
-    if runs_json_path.exists():
+    runs_by_session_id = {}
+    if RUNS_JSON.exists():
         try:
-            with open(runs_json_path, 'r') as f:
+            with open(RUNS_JSON, 'r', encoding='utf-8') as f:
                 runs_data = json.load(f)
-                runs = runs_data.get("runs", {}) if isinstance(runs_data, dict) else {}
-                for run_id, run_info in runs.items():
-                    child_key = run_info.get("childSessionKey")
-                    if child_key:
-                        runs_by_key[child_key] = {
-                            "childSessionKey": child_key,
-                            "task": run_info.get("task", ""),
-                            "taskIndex": run_info.get("taskIndex"),
-                            "totalTasks": run_info.get("totalTasks"),
-                            "endedAt": run_info.get("endedAt"),
-                            "outcome": run_info.get("outcome"),
-                            "cleanup": run_info.get("cleanup", "keep")
-                        }
+            runs = runs_data.get("runs", {}) if isinstance(runs_data, dict) else {}
+            run_items = list(runs.items()) if isinstance(runs, dict) else [(i, r) for i, r in enumerate(runs) if isinstance(r, dict)] if isinstance(runs, list) else []
+            for _rid, run_info in run_items:
+                child_key = run_info.get("childSessionKey") or run_info.get("sessionKey")
+                session_id = run_info.get("sessionId")
+                if not child_key and session_id:
+                    child_key = f"agent:main:subagent:{session_id}"
+                if child_key:
+                    blob = {
+                        "childSessionKey": child_key,
+                        "task": run_info.get("task", ""),
+                        "taskIndex": run_info.get("taskIndex"),
+                        "totalTasks": run_info.get("totalTasks"),
+                        "endedAt": run_info.get("endedAt"),
+                        "outcome": run_info.get("outcome"),
+                        "cleanup": run_info.get("cleanup", "keep")
+                    }
+                    runs_by_key[child_key] = blob
+                    if session_id:
+                        runs_by_session_id[str(session_id)] = blob
         except Exception as e:
             print(f"Error loading runs.json: {e}", file=sys.stderr)
     
-    # Enrich agents with task info from runs.json
     for agent in agents:
         agent_key = agent.get("key")
+        session_id = agent.get("sessionId")
+        run_info = None
         if agent_key and agent_key in runs_by_key:
             run_info = runs_by_key[agent_key]
-            agent["task"] = run_info.get("task", "")
+        elif session_id and str(session_id) in runs_by_session_id:
+            run_info = runs_by_session_id[str(session_id)]
+        if run_info:
+            task = run_info.get("task", "")
+            if task:
+                agent["task"] = task
             agent["taskIndex"] = run_info.get("taskIndex")
             agent["totalTasks"] = run_info.get("totalTasks")
             agent["endedAt"] = run_info.get("endedAt")
             agent["outcome"] = run_info.get("outcome")
             agent["cleanup"] = run_info.get("cleanup", "keep")
-            # Mark as completed if endedAt exists
             if run_info.get("endedAt"):
                 agent["completed"] = True
-                # Check outcome status for error detection
                 outcome = run_info.get("outcome", {})
                 if isinstance(outcome, dict):
                     agent["outcomeStatus"] = outcome.get("status")
                     agent["outcomeError"] = outcome.get("error")
                     agent["outcomeMessage"] = outcome.get("message")
+        # Ensure task is always a string; keep tracker/session task if runs didn't provide one
+        if "task" not in agent or agent.get("task") is None:
+            agent["task"] = ""
+        else:
+            agent["task"] = str(agent["task"]) if agent["task"] else ""
         
-        # Ensure token fields are numbers, not null/None
         input_tokens = agent.get("inputTokens")
         output_tokens = agent.get("outputTokens")
-        # Handle both None and null (which becomes None when parsed from JSON)
         agent["inputTokens"] = int(input_tokens) if input_tokens is not None and input_tokens != "null" else 0
         agent["outputTokens"] = int(output_tokens) if output_tokens is not None and output_tokens != "null" else 0
         
-        # Ensure model field exists - match subagent-tracker's get_model_display logic
         model = agent.get("model")
-        # Check if model is None, empty string, or "unknown"
         if model is None or model == "" or model == "unknown":
             model_override = agent.get("modelOverride")
             provider_override = agent.get("providerOverride")
-            # Only use override if it's not None/null
             if model_override and model_override != "null" and provider_override and provider_override != "null":
                 agent["model"] = f"{provider_override}/{model_override}"
             elif model_override and model_override != "null":
@@ -1829,10 +1858,21 @@ def get_subagents():
             elif provider_override and provider_override != "null":
                 agent["model"] = provider_override
             else:
-                # Keep original model if it exists, otherwise "unknown"
                 agent["model"] = model if model else "unknown"
+    
+    return agents, runs_by_key
 
-    # Include recently cancelled jobs even if no longer active in sessions list.
+@app.route('/api/sessions')
+def get_sessions():
+    """Get list of active sessions (alias for /api/subagents for compatibility)."""
+    result = run_tracker("list", "--active", "60")
+    if "error" in result:
+        return jsonify({"error": result["error"], "sessions": []}), 500
+    
+    agents = result if isinstance(result, list) else []
+    agents, runs_by_key = _enrich_agents_with_runs(agents)
+    
+    # Include recently cancelled jobs (same as get_subagents)
     active_keys = {a.get("key") for a in agents if a.get("key")}
     now_ms = int(time.time() * 1000)
     recent_window_ms = 24 * 60 * 60 * 1000
@@ -1869,7 +1909,76 @@ def get_subagents():
             "outcomeMessage": outcome.get("message"),
         })
     
-    return jsonify({"subagents": agents})
+    return jsonify({"sessions": agents})
+
+@app.route('/api/subagents')
+def get_subagents():
+    """Get list of all sessions: subagents, main, and optionally cron. Always detects all from sessions.json.
+    Query param: minutes=N (optional) to filter to sessions active within N minutes; omit to show all.
+    Query param: cron=1 to include cron job sessions."""
+    try:
+        include_cron = request.args.get("cron", "false").lower() in ("1", "true", "yes")
+        args_list = ["--include-main"]
+        if include_cron:
+            args_list.append("--include-cron")
+        minutes = request.args.get("minutes")
+        if minutes is not None:
+            try:
+                m = max(1, min(int(minutes), 43200))
+                args_list.extend(["--active", str(m)])
+            except ValueError:
+                pass
+        result = run_tracker("list", *args_list)
+        if "error" in result:
+            return jsonify({"error": result["error"], "subagents": []}), 500
+        
+        agents = result if isinstance(result, list) else []
+        if not isinstance(agents, list):
+            agents = []
+        agents, runs_by_key = _enrich_agents_with_runs(agents)
+        
+        # Include recently cancelled jobs even if no longer active in sessions list.
+        active_keys = {a.get("key") for a in agents if isinstance(a, dict) and a.get("key")}
+        now_ms = int(time.time() * 1000)
+        recent_window_ms = 24 * 60 * 60 * 1000
+        for child_key, run_info in runs_by_key.items():
+            if child_key in active_keys:
+                continue
+            outcome = run_info.get("outcome") if isinstance(run_info, dict) else None
+            if not isinstance(outcome, dict):
+                continue
+            status = str(outcome.get("status", "")).lower()
+            if status not in ("cancelled", "canceled", "killed"):
+                continue
+            ended_at = run_info.get("endedAt")
+            if ended_at and isinstance(ended_at, (int, float)) and (now_ms - int(ended_at)) > recent_window_ms:
+                continue
+            pseudo_session_id = child_key.split(":")[-1] if child_key else f"cancelled-{len(agents)+1}"
+            agents.append({
+                "agentIndex": len(agents) + 1,
+                "role": "subagent",
+                "key": child_key,
+                "sessionId": pseudo_session_id,
+                "updatedAt": ended_at or now_ms,
+                "ageMs": max(0, now_ms - int(ended_at)) if isinstance(ended_at, (int, float)) else 0,
+                "model": "unknown",
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "task": run_info.get("task", ""),
+                "taskIndex": run_info.get("taskIndex"),
+                "totalTasks": run_info.get("totalTasks"),
+                "endedAt": ended_at,
+                "completed": True,
+                "outcome": outcome,
+                "outcomeStatus": outcome.get("status"),
+                "outcomeError": outcome.get("error"),
+                "outcomeMessage": outcome.get("message"),
+            })
+        
+        return jsonify({"subagents": agents})
+    except Exception as e:
+        print(f"get_subagents error: {e}", file=sys.stderr)
+        return jsonify({"error": str(e), "subagents": []}), 500
 
 @app.route('/api/subagent/<session_id>/status')
 def get_subagent_status(session_id):
@@ -1878,6 +1987,40 @@ def get_subagent_status(session_id):
     if "error" in result:
         return jsonify({"error": result["error"]}), 500
     return jsonify(result)
+
+@app.route('/api/sessions/<session_id>')
+def get_session_detail(session_id):
+    """Get session details including transcript."""
+    # Get status
+    status_result = run_tracker("status", session_id)
+    if "error" in status_result:
+        return jsonify({"error": status_result["error"]}), 500
+    
+    session_data = status_result.get("session", {})
+    
+    # Get transcript
+    transcript_path = SESSIONS_PATH / f"{session_id}.jsonl"
+    events = []
+    if transcript_path.exists():
+        try:
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+                recent_lines = all_lines[-50:] if len(all_lines) > 50 else all_lines
+                for line in recent_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        if isinstance(event, dict):
+                            events.append(event)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+        except Exception:
+            pass
+    
+    session_data["transcript"] = events
+    return jsonify(session_data)
 
 @app.route('/api/subagent/<session_id>/transcript')
 def get_subagent_transcript(session_id):
@@ -1989,7 +2132,7 @@ def kill_subagent(session_id):
 
     # Mark matching run as ended/cancelled in runs.json if present.
     run_marked_cancelled = False
-    runs_json_path = OPENCLAW_HOME / "subagents" / "runs.json"
+    runs_json_path = RUNS_JSON
     if runs_json_path.exists():
         try:
             with open(runs_json_path, "r", encoding="utf-8") as f:
@@ -2049,7 +2192,7 @@ def resume_subagent(session_id):
     
     # Try to get session key from runs.json if not provided
     if not session_key:
-        runs_json_path = OPENCLAW_HOME / "subagents" / "runs.json"
+        runs_json_path = RUNS_JSON
         if runs_json_path.exists():
             try:
                 with open(runs_json_path, 'r') as f:
@@ -2113,7 +2256,7 @@ def restart_subagent(session_id):
     
     # Get task from runs.json if not provided
     if not task:
-        runs_json_path = OPENCLAW_HOME / "subagents" / "runs.json"
+        runs_json_path = RUNS_JSON
         if runs_json_path.exists():
             try:
                 with open(runs_json_path, 'r') as f:
@@ -2145,6 +2288,508 @@ def get_stalled():
     if isinstance(result, list):
         return jsonify({"stalled": result})
     return jsonify({"stalled": []})
+
+@app.route('/api/gateway/status')
+def get_gateway_status():
+    """Get gateway health status via gateway-guard."""
+    gateway_guard_script = OPENCLAW_HOME / "workspace" / "skills" / "gateway-guard" / "scripts" / "gateway_guard.py"
+    
+    if not gateway_guard_script.exists():
+        return jsonify({
+            "ok": False,
+            "running": False,
+            "reason": "gateway_guard_script_not_found"
+        }), 200
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, str(gateway_guard_script), "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(OPENCLAW_HOME),
+            env={**os.environ, "OPENCLAW_HOME": str(OPENCLAW_HOME)}
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                status_data = json.loads(result.stdout.strip())
+                # Return only safe fields (no secrets)
+                return jsonify({
+                    "ok": status_data.get("ok", False),
+                    "running": status_data.get("running", False),
+                    "reason": status_data.get("reason", "unknown"),
+                    "recommendedAction": status_data.get("recommendedAction", "none")
+                })
+            except json.JSONDecodeError as e:
+                # Script returned non-JSON output
+                error_msg = result.stderr[:200] if result.stderr else result.stdout[:200]
+                return jsonify({
+                    "ok": False,
+                    "running": False,
+                    "reason": f"gateway_guard_invalid_json: {error_msg}",
+                    "recommendedAction": "check gateway_guard script"
+                })
+        
+        # Script failed - include stderr if available
+        error_msg = result.stderr[:200] if result.stderr else "unknown_error"
+        if "PermissionError" in error_msg or "Operation not permitted" in error_msg:
+            return jsonify({
+                "ok": False,
+                "running": False,
+                "reason": "gateway_guard_permission_error",
+                "recommendedAction": "gateway_guard needs system permissions (check Terminal/Full Disk Access)"
+            })
+        
+        # Fallback if script fails or returns invalid JSON
+        return jsonify({
+            "ok": False,
+            "running": False,
+            "reason": f"gateway_guard_check_failed (exit {result.returncode}): {error_msg}",
+            "recommendedAction": "check gateway manually or gateway_guard script"
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "ok": False,
+            "running": False,
+            "reason": "gateway_guard_timeout",
+            "recommendedAction": "check gateway manually"
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "running": False,
+            "reason": f"error: {str(e)[:100]}",
+            "recommendedAction": "check gateway manually"
+        })
+
+@app.route('/api/gateway/config')
+def get_gateway_config():
+    """Get gateway configuration (port, auth mode) from openclaw.json."""
+    config_path = OPENCLAW_HOME / "openclaw.json"
+    if not config_path.exists():
+        return jsonify({
+            "port": 18789,
+            "mode": "token"
+        }), 200
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        gateway = config.get("gateway", {})
+        auth = gateway.get("auth", {})
+        return jsonify({
+            "port": gateway.get("port", 18789),
+            "mode": auth.get("mode", "token")
+        })
+    except Exception as e:
+        return jsonify({
+            "port": 18789,
+            "mode": "token",
+            "error": str(e)[:100]
+        }), 200
+
+@app.route('/api/sessions/spawn', methods=['POST'])
+def spawn_session():
+    """Spawn a new agent session via gateway."""
+    data = request.get_json() or {}
+    task = data.get("task", "")
+    model = data.get("model", "")
+    session_target = data.get("sessionTarget", "")
+    
+    if not task or not model:
+        return jsonify({"error": "task and model are required"}), 400
+    
+    # Use router.py spawn to get proper model routing, then call gateway
+    router_script = OPENCLAW_HOME / "workspace" / "skills" / "agent-swarm" / "scripts" / "router.py"
+    if router_script.exists():
+        try:
+            # Run router to get proper model routing
+            router_result = subprocess.run(
+                [sys.executable, str(router_script), "spawn", "--json", task],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(OPENCLAW_HOME),
+                env={**os.environ, "OPENCLAW_HOME": str(OPENCLAW_HOME)}
+            )
+            if router_result.returncode == 0 and router_result.stdout.strip():
+                router_data = json.loads(router_result.stdout.strip())
+                model = router_data.get("model", model)
+                task = router_data.get("task", task)
+                session_target = router_data.get("sessionTarget", session_target)
+        except Exception:
+            pass  # Fall back to provided values
+    
+    # For now, return a placeholder - actual spawning would need gateway integration
+    # This is a temporary implementation until gateway-attached API exists
+    return jsonify({
+        "sessionId": f"session-{int(time.time())}",
+        "sessionKey": f"agent:main:subagent:session-{int(time.time())}",
+        "note": "Gateway integration pending - this is a placeholder"
+    }), 200
+
+@app.route('/api/sessions/<session_id>/send', methods=['POST'])
+def send_to_session(session_id):
+    """Send a message to a session."""
+    data = request.get_json() or {}
+    message = data.get("message", "")
+    
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    
+    # Placeholder - actual implementation would use gateway sessions_send
+    return jsonify({"success": True, "note": "Gateway integration pending"}), 200
+
+@app.route('/api/sessions/<session_id>/kill', methods=['POST'])
+def kill_session(session_id):
+    """Kill a session."""
+    return kill_subagent(session_id)
+
+@app.route('/api/sessions/<session_id>/stream')
+def stream_session(session_id):
+    """SSE stream for session updates."""
+    from flask import Response
+    
+    def generate():
+        # Placeholder SSE stream
+        yield f"data: {json.dumps({'type': 'connected', 'sessionId': session_id})}\n\n"
+        # In real implementation, would stream transcript updates
+        time.sleep(1)
+        yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/files/tree')
+def get_file_tree():
+    """Get file tree for workspace."""
+    workspace_path = request.args.get('root') or (OPENCLAW_HOME / "workspace")
+    if isinstance(workspace_path, str):
+        workspace_path = Path(workspace_path)
+    else:
+        workspace_path = Path(workspace_path)
+    
+    def build_tree(path: Path, base: Path) -> list:
+        if not path.exists():
+            return []
+        if path.is_file():
+            return [{
+                "name": path.name,
+                "path": str(path.relative_to(base)),
+                "type": "file"
+            }]
+        children = []
+        try:
+            for item in sorted(path.iterdir()):
+                if item.is_dir():
+                    dir_children = build_tree(item, base)
+                    children.append({
+                        "name": item.name,
+                        "path": str(item.relative_to(base)),
+                        "type": "directory",
+                        "children": dir_children
+                    })
+                else:
+                    children.append({
+                        "name": item.name,
+                        "path": str(item.relative_to(base)),
+                        "type": "file"
+                    })
+        except PermissionError:
+            pass
+        return children
+    
+    tree = build_tree(Path(workspace_path), Path(workspace_path))
+    return jsonify(tree)
+
+@app.route('/api/files/content')
+def get_file_content():
+    """Get file content."""
+    path = request.args.get('path')
+    if not path:
+        return jsonify({"error": "path is required"}), 400
+    
+    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    if not file_path.exists() or not file_path.is_file():
+        return jsonify({"error": "file not found"}), 404
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return jsonify({"path": path, "content": content})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/files/content', methods=['PUT'])
+def write_file_content():
+    """Write file content."""
+    data = request.get_json() or {}
+    path = data.get("path")
+    content = data.get("content", "")
+    
+    if not path:
+        return jsonify({"error": "path is required"}), 400
+    
+    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/files/content', methods=['DELETE'])
+def delete_file():
+    """Delete a file."""
+    data = request.get_json() or {}
+    path = data.get("path")
+    
+    if not path:
+        return jsonify({"error": "path is required"}), 400
+    
+    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    try:
+        if file_path.exists():
+            file_path.unlink()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/files/rename', methods=['POST'])
+def rename_file():
+    """Rename/move a file."""
+    data = request.get_json() or {}
+    old_path = data.get("oldPath")
+    new_path = data.get("newPath")
+    
+    if not old_path or not new_path:
+        return jsonify({"error": "oldPath and newPath are required"}), 400
+    
+    old_file = OPENCLAW_HOME / "workspace" / old_path.lstrip('/')
+    new_file = OPENCLAW_HOME / "workspace" / new_path.lstrip('/')
+    
+    try:
+        new_file.parent.mkdir(parents=True, exist_ok=True)
+        old_file.rename(new_file)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/status')
+def get_git_status():
+    """Get git status."""
+    workspace_path = request.args.get('path') or (OPENCLAW_HOME / "workspace")
+    if isinstance(workspace_path, str):
+        workspace_path = Path(workspace_path)
+    
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--branch"],
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            return jsonify({"error": "not a git repository"}), 404
+        
+        staged = []
+        unstaged = []
+        untracked = []
+        branch = "main"
+        
+        for line in result.stdout.split('\n'):
+            if line.startswith('##'):
+                # Branch line
+                branch = line.split('...')[0].replace('##', '').strip()
+            elif line:
+                status = line[:2]
+                path = line[3:]
+                if status[0] != ' ':
+                    staged.append({"path": path, "status": "modified"})
+                if status[1] != ' ':
+                    if status[1] == '?':
+                        untracked.append({"path": path, "status": "untracked"})
+                    else:
+                        unstaged.append({"path": path, "status": "modified"})
+        
+        return jsonify({
+            "branch": branch,
+            "ahead": 0,  # Would need git log to calculate
+            "behind": 0,
+            "staged": staged,
+            "unstaged": unstaged,
+            "untracked": untracked
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/stage', methods=['POST'])
+def stage_files():
+    """Stage files."""
+    data = request.get_json() or {}
+    paths = data.get("paths", [])
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        subprocess.run(
+            ["git", "add"] + paths,
+            cwd=str(workspace_path),
+            timeout=5
+        )
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/unstage', methods=['POST'])
+def unstage_files():
+    """Unstage files."""
+    data = request.get_json() or {}
+    paths = data.get("paths", [])
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        subprocess.run(
+            ["git", "reset", "HEAD"] + paths,
+            cwd=str(workspace_path),
+            timeout=5
+        )
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/commit', methods=['POST'])
+def commit_changes():
+    """Commit staged changes."""
+    data = request.get_json() or {}
+    message = data.get("message", "")
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    
+    try:
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"error": result.stderr}), 500
+        
+        # Get commit hash
+        hash_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        hash_value = hash_result.stdout.strip() if hash_result.returncode == 0 else ""
+        
+        return jsonify({"success": True, "hash": hash_value})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/push', methods=['POST'])
+def push_changes():
+    """Push to remote."""
+    branch = request.args.get('branch')
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        cmd = ["git", "push"]
+        if branch:
+            cmd.extend(["origin", branch])
+        subprocess.run(cmd, cwd=str(workspace_path), timeout=30)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/pull', methods=['POST'])
+def pull_changes():
+    """Pull from remote."""
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        subprocess.run(["git", "pull"], cwd=str(workspace_path), timeout=30)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/log')
+def get_commit_log():
+    """Get commit history."""
+    limit = int(request.args.get('limit', 50))
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        result = subprocess.run(
+            ["git", "log", f"-{limit}", "--pretty=format:%H|%s|%an|%at"],
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        commits = []
+        for line in result.stdout.split('\n'):
+            if line:
+                parts = line.split('|')
+                if len(parts) >= 4:
+                    commits.append({
+                        "hash": parts[0],
+                        "message": parts[1],
+                        "author": parts[2],
+                        "date": int(parts[3]),
+                        "files": []
+                    })
+        
+        return jsonify(commits)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/branches')
+def get_branches():
+    """Get list of branches."""
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--format=%(refname:short)"],
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        branches = [b.strip() for b in result.stdout.split('\n') if b.strip()]
+        return jsonify(branches)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/git/checkout', methods=['POST'])
+def checkout_branch():
+    """Switch branch."""
+    data = request.get_json() or {}
+    branch = data.get("branch")
+    workspace_path = OPENCLAW_HOME / "workspace"
+    
+    if not branch:
+        return jsonify({"error": "branch is required"}), 400
+    
+    try:
+        subprocess.run(
+            ["git", "checkout", branch],
+            cwd=str(workspace_path),
+            timeout=5
+        )
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))  # Default to 8080 to avoid macOS AirPlay conflict

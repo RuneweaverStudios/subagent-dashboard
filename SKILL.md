@@ -1,14 +1,14 @@
+---
+---
+
+# Skill
+
+## Description
+
 # Subagent Dashboard Skill
 
 Web dashboard for real-time monitoring and management of OpenClaw subagents.
 
-## Purpose
-
-Provides a web UI to:
-- Monitor active subagents in real-time
-- View agent transcripts and activity
-- Detect and manage stalled agents
-- Track task progress and token usage
 
 ## Installation
 
@@ -25,16 +25,27 @@ pip install -r ../requirements.txt
 python3 dashboard.py
 ```
 
+
 ## Usage
 
 Start the dashboard and open http://localhost:8080 in your browser.
 
 The dashboard shows:
-- All active subagents (active within 60 minutes)
+- **All sessions** from sessions.json: main (orchestrator), subagents, and optionally cron jobs
 - Real-time updates (auto-refresh every 3 seconds)
-- Agent details: model, age, tokens, task progress
+- Agent details: model, age, tokens, task progress; role badges (Main / Subagent / Cron)
 - Transcript viewing for each agent
 - Stalled agent detection (>30 min inactive)
+
+
+## Purpose
+
+Provides a web UI to:
+- Monitor active subagents in real-time
+- View agent transcripts and activity
+- Detect and manage stalled agents
+- Track task progress and token usage
+
 
 ## Dependencies
 
@@ -42,9 +53,11 @@ The dashboard shows:
 - flask-cors (CORS support)
 - Subagent-tracker skill (for data)
 
+
 ## Configuration
 
 Set `PORT` environment variable to change the server port (default: 8080).
+
 
 ## Integration
 
