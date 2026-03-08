@@ -22,8 +22,30 @@ SESSIONS_PATH = OPENCLAW_HOME / "agents" / "main" / "sessions"
 SESSIONS_JSON = SESSIONS_PATH / "sessions.json"
 RUNS_JSON = OPENCLAW_HOME / "agents" / "main" / "subagents" / "runs.json"
 
+WORKSPACE_DIR = OPENCLAW_HOME / "workspace"
+
+import re as _re
+
+def _validate_path_in_workspace(user_path):
+    """SECURITY: Resolve path and verify it stays within the workspace directory.
+    Returns (resolved_path, error_response) — error_response is None if valid."""
+    workspace_real = os.path.realpath(str(WORKSPACE_DIR))
+    resolved = os.path.realpath(str(WORKSPACE_DIR / user_path.lstrip('/')))
+    if not resolved.startswith(workspace_real + os.sep) and resolved != workspace_real:
+        return None, (jsonify({"error": "path traversal blocked"}), 403)
+    return Path(resolved), None
+
+_BRANCH_NAME_RE = _re.compile(r'^[a-zA-Z0-9_/.-]+$')
+
+def _validate_branch_name(branch):
+    """SECURITY: Only allow safe branch name characters."""
+    if not branch or not _BRANCH_NAME_RE.match(branch) or '..' in branch:
+        return False
+    return True
+
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# SECURITY: Restrict CORS to localhost only (not wildcard '*')
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:*", "http://127.0.0.1:*"]}})
 
 # Dashboard HTML template (defined before routes that use it)
 DASHBOARD_HTML = '''<!DOCTYPE html>
@@ -2509,10 +2531,12 @@ def get_file_content():
     if not path:
         return jsonify({"error": "path is required"}), 400
     
-    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    file_path, err = _validate_path_in_workspace(path)
+    if err:
+        return err
     if not file_path.exists() or not file_path.is_file():
         return jsonify({"error": "file not found"}), 404
-    
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -2530,7 +2554,9 @@ def write_file_content():
     if not path:
         return jsonify({"error": "path is required"}), 400
     
-    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    file_path, err = _validate_path_in_workspace(path)
+    if err:
+        return err
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -2548,7 +2574,9 @@ def delete_file():
     if not path:
         return jsonify({"error": "path is required"}), 400
     
-    file_path = OPENCLAW_HOME / "workspace" / path.lstrip('/')
+    file_path, err = _validate_path_in_workspace(path)
+    if err:
+        return err
     try:
         if file_path.exists():
             file_path.unlink()
@@ -2566,9 +2594,13 @@ def rename_file():
     if not old_path or not new_path:
         return jsonify({"error": "oldPath and newPath are required"}), 400
     
-    old_file = OPENCLAW_HOME / "workspace" / old_path.lstrip('/')
-    new_file = OPENCLAW_HOME / "workspace" / new_path.lstrip('/')
-    
+    old_file, err = _validate_path_in_workspace(old_path)
+    if err:
+        return err
+    new_file, err = _validate_path_in_workspace(new_path)
+    if err:
+        return err
+
     try:
         new_file.parent.mkdir(parents=True, exist_ok=True)
         old_file.rename(new_file)
@@ -2780,7 +2812,10 @@ def checkout_branch():
     
     if not branch:
         return jsonify({"error": "branch is required"}), 400
-    
+
+    if not _validate_branch_name(branch):
+        return jsonify({"error": "invalid branch name"}), 400
+
     try:
         subprocess.run(
             ["git", "checkout", branch],
