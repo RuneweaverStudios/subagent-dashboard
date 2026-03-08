@@ -1,0 +1,6 @@
+{
+  "port": 5111,
+  "host": "127.0.0.1",
+  "workspace_dir": "~/.openclaw",
+  "refresh_interval_seconds": 5
+}
