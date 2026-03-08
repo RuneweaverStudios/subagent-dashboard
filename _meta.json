@@ -1,10 +1,14 @@
 {
   "schema": "openclaw.skill.v1",
   "name": "subagent-dashboard",
-  "version": "1.0.0",
-  "displayName": "Subagent Dashboard",
-  "description": "Web dashboard for real-time monitoring and management of OpenClaw subagents.",
-  "author": "OpenClaw",
-  "tags": ["subagent", "dashboard", "monitoring", "openclaw"],
+  "slug": "subagent-dashboard",
+  "version": "1.1.0",
+  "displayName": "Subagent Dashboard | OpenClaw Skill",
+  "description": "Web dashboard for real-time monitoring and management of OpenClaw subagents. View active agents, transcripts, task progress, and manage stalled sessions.",
+  "author": "RuneweaverStudios",
+  "tags": ["subagent", "dashboard", "monitoring", "openclaw", "web-ui"],
+  "main": "scripts/dashboard.py",
+  "icon": "activity",
+  "color": "#8ab4f8",
   "platform": "openclaw"
 }

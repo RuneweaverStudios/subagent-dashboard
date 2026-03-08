@@ -38,6 +38,11 @@ The dashboard refreshes every 3 seconds automatically. Click "Pause" to stop, "R
 PORT=9000 python3 dashboard.py
 ```
 
+**Need network access (not just localhost)?**
+```bash
+HOST=0.0.0.0 PORT=8080 python3 dashboard.py
+```
+
 **Dependencies missing?**
 ```bash
 pip install Flask flask-cors

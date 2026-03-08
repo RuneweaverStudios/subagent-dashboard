@@ -2484,12 +2484,19 @@ def stream_session(session_id):
 
 @app.route('/api/files/tree')
 def get_file_tree():
-    """Get file tree for workspace."""
-    workspace_path = request.args.get('root') or (OPENCLAW_HOME / "workspace")
-    if isinstance(workspace_path, str):
-        workspace_path = Path(workspace_path)
+    """Get file tree for workspace.
+    SECURITY: The 'root' parameter is restricted to the workspace directory.
+    Arbitrary directory traversal is blocked via realpath validation."""
+    root_param = request.args.get('root')
+    if root_param:
+        # Validate that requested root is within workspace
+        workspace_real = os.path.realpath(str(WORKSPACE_DIR))
+        resolved_root = os.path.realpath(root_param)
+        if not resolved_root.startswith(workspace_real + os.sep) and resolved_root != workspace_real:
+            return jsonify({"error": "path traversal blocked: root must be within workspace"}), 403
+        workspace_path = Path(resolved_root)
     else:
-        workspace_path = Path(workspace_path)
+        workspace_path = WORKSPACE_DIR
     
     def build_tree(path: Path, base: Path) -> list:
         if not path.exists():
@@ -2610,10 +2617,17 @@ def rename_file():
 
 @app.route('/api/git/status')
 def get_git_status():
-    """Get git status."""
-    workspace_path = request.args.get('path') or (OPENCLAW_HOME / "workspace")
-    if isinstance(workspace_path, str):
-        workspace_path = Path(workspace_path)
+    """Get git status.
+    SECURITY: The 'path' parameter is restricted to the workspace directory."""
+    path_param = request.args.get('path')
+    if path_param:
+        workspace_real = os.path.realpath(str(WORKSPACE_DIR))
+        resolved = os.path.realpath(path_param)
+        if not resolved.startswith(workspace_real + os.sep) and resolved != workspace_real:
+            return jsonify({"error": "path traversal blocked"}), 403
+        workspace_path = Path(resolved)
+    else:
+        workspace_path = WORKSPACE_DIR
     
     try:
         result = subprocess.run(
@@ -2660,14 +2674,30 @@ def get_git_status():
 
 @app.route('/api/git/stage', methods=['POST'])
 def stage_files():
-    """Stage files."""
+    """Stage files.
+    SECURITY: Each path is validated to be within the workspace directory."""
     data = request.get_json() or {}
     paths = data.get("paths", [])
-    workspace_path = OPENCLAW_HOME / "workspace"
-    
+    workspace_path = WORKSPACE_DIR
+
+    if not paths or not isinstance(paths, list):
+        return jsonify({"error": "paths array is required"}), 400
+
+    # Validate each path is within workspace
+    validated_paths = []
+    workspace_real = os.path.realpath(str(workspace_path))
+    for p in paths:
+        if not isinstance(p, str) or not p.strip():
+            return jsonify({"error": f"invalid path: {p}"}), 400
+        resolved = os.path.realpath(os.path.join(workspace_real, p))
+        if not resolved.startswith(workspace_real + os.sep) and resolved != workspace_real:
+            return jsonify({"error": f"path traversal blocked: {p}"}), 403
+        # Use the relative path for git add
+        validated_paths.append(os.path.relpath(resolved, workspace_real))
+
     try:
         subprocess.run(
-            ["git", "add"] + paths,
+            ["git", "add", "--"] + validated_paths,
             cwd=str(workspace_path),
             timeout=5
         )
@@ -2677,14 +2707,29 @@ def stage_files():
 
 @app.route('/api/git/unstage', methods=['POST'])
 def unstage_files():
-    """Unstage files."""
+    """Unstage files.
+    SECURITY: Each path is validated to be within the workspace directory."""
     data = request.get_json() or {}
     paths = data.get("paths", [])
-    workspace_path = OPENCLAW_HOME / "workspace"
-    
+    workspace_path = WORKSPACE_DIR
+
+    if not paths or not isinstance(paths, list):
+        return jsonify({"error": "paths array is required"}), 400
+
+    # Validate each path is within workspace
+    validated_paths = []
+    workspace_real = os.path.realpath(str(workspace_path))
+    for p in paths:
+        if not isinstance(p, str) or not p.strip():
+            return jsonify({"error": f"invalid path: {p}"}), 400
+        resolved = os.path.realpath(os.path.join(workspace_real, p))
+        if not resolved.startswith(workspace_real + os.sep) and resolved != workspace_real:
+            return jsonify({"error": f"path traversal blocked: {p}"}), 403
+        validated_paths.append(os.path.relpath(resolved, workspace_real))
+
     try:
         subprocess.run(
-            ["git", "reset", "HEAD"] + paths,
+            ["git", "reset", "HEAD", "--"] + validated_paths,
             cwd=str(workspace_path),
             timeout=5
         )
@@ -2731,8 +2776,11 @@ def commit_changes():
 def push_changes():
     """Push to remote."""
     branch = request.args.get('branch')
-    workspace_path = OPENCLAW_HOME / "workspace"
-    
+    workspace_path = WORKSPACE_DIR
+
+    if branch and not _validate_branch_name(branch):
+        return jsonify({"error": "invalid branch name"}), 400
+
     try:
         cmd = ["git", "push"]
         if branch:
@@ -2830,4 +2878,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))  # Default to 8080 to avoid macOS AirPlay conflict
     print(f"Starting Subagent Dashboard on http://localhost:{port}")
     print(f"OpenClaw Home: {OPENCLAW_HOME}")
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # SECURITY: debug=False in production (Werkzeug debugger exposes RCE).
+    # Bind to 127.0.0.1 by default (localhost only). Set HOST=0.0.0.0 to expose.
+    host = os.environ.get('HOST', '127.0.0.1')
+    app.run(host=host, port=port, debug=False)

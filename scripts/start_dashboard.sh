@@ -22,6 +22,8 @@ pip install -q -r "$(dirname "$SCRIPT_DIR")/requirements.txt"
 
 # Start the dashboard (use port 8080 to avoid macOS AirPlay Receiver conflict)
 PORT=${PORT:-8080}
+HOST=${HOST:-127.0.0.1}
 echo "Starting Subagent Dashboard..."
-echo "Open http://localhost:$PORT in your browser"
-PORT=$PORT python3 dashboard.py
+echo "Open http://${HOST}:$PORT in your browser"
+echo "Security: Bound to $HOST only (set HOST=0.0.0.0 to expose to network)"
+PORT=$PORT HOST=$HOST python3 dashboard.py
